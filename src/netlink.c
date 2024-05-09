@@ -38,7 +38,8 @@ static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
 	[WGPEER_A_RX_BYTES]				= { .type = NLA_U64 },
 	[WGPEER_A_TX_BYTES]				= { .type = NLA_U64 },
 	[WGPEER_A_ALLOWEDIPS]				= { .type = NLA_NESTED },
-	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 }
+	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 },
+	[WGPEER_A_CIRCUIT_ID]					= { .type = NLA_U8 }
 };
 
 static const struct nla_policy allowedip_policy[WGALLOWEDIP_A_MAX + 1] = {
@@ -115,6 +116,9 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 	fail = nla_put(skb, WGPEER_A_PUBLIC_KEY, NOISE_PUBLIC_KEY_LEN,
 		       peer->handshake.remote_static);
 	up_read(&peer->handshake.lock);
+
+	fail = nla_put_u8(skb, WGPEER_A_CIRCUIT_ID, peer->circuit_id);
+
 	if (fail)
 		goto err;
 
@@ -157,7 +161,7 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 			goto err;
 		allowedips_node =
 			list_first_entry_or_null(&peer->allowedips_list,
-					struct allowedips_node, peer_list);
+					struct allowedips_node, peer_list[peer->circuit_id]);
 	}
 	if (!allowedips_node)
 		goto no_allowedips;
@@ -171,7 +175,7 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 		goto err;
 
 	list_for_each_entry_from(allowedips_node, &peer->allowedips_list,
-				 peer_list) {
+				 peer_list[peer->circuit_id]) {
 		u8 cidr, ip[16] __aligned(__alignof(u64));
 		int family;
 
@@ -357,6 +361,7 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 	u8 *public_key = NULL, *preshared_key = NULL;
 	struct wg_peer *peer = NULL;
 	u32 flags = 0;
+	u8 circuit_id = 0;
 	int ret;
 
 	ret = -EINVAL;
@@ -379,6 +384,10 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 	if (attrs[WGPEER_A_PROTOCOL_VERSION]) {
 		if (nla_get_u32(attrs[WGPEER_A_PROTOCOL_VERSION]) != 1)
 			goto out;
+	}
+
+	if (attrs[WGPEER_A_CIRCUIT_ID]) {
+		circuit_id = nla_get_u8(attrs[WGPEER_A_CIRCUIT_ID]);
 	}
 
 	peer = wg_pubkey_hashtable_lookup(wg->peer_hashtable,
@@ -407,7 +416,7 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		}
 		up_read(&wg->static_identity.lock);
 
-		peer = wg_peer_create(wg, public_key, preshared_key);
+		peer = wg_peer_create(wg, public_key, preshared_key, circuit_id);
 		if (IS_ERR(peer)) {
 			ret = PTR_ERR(peer);
 			peer = NULL;
@@ -418,6 +427,7 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		 */
 		wg_peer_get(peer);
 	}
+
 
 	if (flags & WGPEER_F_REMOVE_ME) {
 		wg_peer_remove(peer);

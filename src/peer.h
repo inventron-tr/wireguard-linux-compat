@@ -64,11 +64,13 @@ struct wg_peer {
 	struct list_head allowedips_list;
 	struct napi_struct napi;
 	u64 internal_id;
+	u8 circuit_id;
 };
 
 struct wg_peer *wg_peer_create(struct wg_device *wg,
 			       const u8 public_key[NOISE_PUBLIC_KEY_LEN],
-			       const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN]);
+			       const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN],
+				   u8 circuit_id);
 
 struct wg_peer *__must_check wg_peer_get_maybe_zero(struct wg_peer *peer);
 static inline struct wg_peer *wg_peer_get(struct wg_peer *peer)

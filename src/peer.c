@@ -20,7 +20,8 @@ static atomic64_t peer_counter = ATOMIC64_INIT(0);
 
 struct wg_peer *wg_peer_create(struct wg_device *wg,
 			       const u8 public_key[NOISE_PUBLIC_KEY_LEN],
-			       const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN])
+			       const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN],
+				   u8 circuit_id)
 {
 	struct wg_peer *peer;
 	int ret = -ENOMEM;
@@ -60,6 +61,7 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
 	list_add_tail(&peer->peer_list, &wg->peer_list);
 	INIT_LIST_HEAD(&peer->allowedips_list);
 	wg_pubkey_hashtable_add(wg->peer_hashtable, peer);
+	peer->circuit_id = circuit_id;
 	++wg->num_peers;
 	pr_debug("%s: Peer %llu created\n", wg->dev->name, peer->internal_id);
 	return peer;

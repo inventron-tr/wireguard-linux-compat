@@ -5,7 +5,9 @@
 
 #include "allowedips.h"
 #include "peer.h"
+#include "debug.h"
 
+#define TOS_MATCH(tos) ((tos >> 2) & 0x07)
 static struct kmem_cache *node_cache;
 
 static void swap_endian(u8 *dst, const u8 *src, u8 bits)
@@ -71,8 +73,13 @@ static void root_remove_peer_lists(struct allowedips_node *root)
 	while (len > 0 && (node = stack[--len])) {
 		push_rcu(stack, node->bit[0], &len);
 		push_rcu(stack, node->bit[1], &len);
-		if (rcu_access_pointer(node->peer))
-			list_del(&node->peer_list);
+		int i = 0;
+		for (; i < MAX_NODE_PEERS; i++)
+		{
+			if (rcu_access_pointer(node->peer[i]))
+				list_del(&node->peer_list[i]);
+		}
+
 	}
 }
 
@@ -111,8 +118,14 @@ static struct allowedips_node *find_node(struct allowedips_node *trie, u8 bits,
 	struct allowedips_node *node = trie, *found = NULL;
 
 	while (node && prefix_matches(node, key, bits)) {
-		if (rcu_access_pointer(node->peer))
-			found = node;
+		int i = 0;
+		for (; i < MAX_NODE_PEERS; i++) {
+			if (rcu_access_pointer(node->peer[i])) {
+				found = node;
+				break;
+			}
+		}
+
 		if (node->cidr == bits)
 			break;
 		node = rcu_dereference_bh(node->bit[choose(node, key)]);
@@ -122,7 +135,7 @@ static struct allowedips_node *find_node(struct allowedips_node *trie, u8 bits,
 
 /* Returns a strong reference to a peer */
 static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
-			      const void *be_ip)
+			      const void *be_ip, u8 tos)
 {
 	/* Aligned so it can be passed to fls/fls64 */
 	u8 ip[16] __aligned(__alignof(u64));
@@ -135,9 +148,20 @@ static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
 retry:
 	node = find_node(rcu_dereference_bh(root), bits, ip);
 	if (node) {
-		peer = wg_peer_get_maybe_zero(rcu_dereference_bh(node->peer));
+		if (tos < MAX_NODE_PEERS) {
+			peer = wg_peer_get_maybe_zero(rcu_dereference_bh(node->peer[tos]));
+		}
+
+		int i = 0;
+		for (; i < MAX_NODE_PEERS && !peer; i++) {
+			peer = wg_peer_get_maybe_zero(rcu_dereference_bh(node->peer[i]));
+		}
+		
 		if (!peer)
 			goto retry;
+		
+		
+
 	}
 	rcu_read_unlock_bh();
 	return peer;
@@ -187,23 +211,29 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 		node = kmem_cache_zalloc(node_cache, GFP_KERNEL);
 		if (unlikely(!node))
 			return -ENOMEM;
-		RCU_INIT_POINTER(node->peer, peer);
-		list_add_tail(&node->peer_list, &peer->allowedips_list);
+		RCU_INIT_POINTER(node->peer[peer->circuit_id], peer);
+		list_add_tail(&node->peer_list[peer->circuit_id], &peer->allowedips_list);
 		copy_and_assign_cidr(node, key, cidr, bits);
 		connect_node(trie, 2, node);
 		return 0;
 	}
 	if (node_placement(*trie, key, cidr, bits, &node, lock)) {
-		rcu_assign_pointer(node->peer, peer);
-		list_move_tail(&node->peer_list, &peer->allowedips_list);
+		if(!rcu_access_pointer(node->peer[peer->circuit_id])) {
+			RCU_INIT_POINTER(node->peer[peer->circuit_id], peer);
+			list_add_tail(&node->peer_list[peer->circuit_id], &peer->allowedips_list);
+		}
+		else 
+		{
+			WG_LOG("NODE PEER FULL DO NOTHING CIRCUIT ID %u", peer->circuit_id);
+		}
 		return 0;
 	}
 
 	newnode = kmem_cache_zalloc(node_cache, GFP_KERNEL);
 	if (unlikely(!newnode))
 		return -ENOMEM;
-	RCU_INIT_POINTER(newnode->peer, peer);
-	list_add_tail(&newnode->peer_list, &peer->allowedips_list);
+	RCU_INIT_POINTER(newnode->peer[peer->circuit_id], peer);
+	list_add_tail(&newnode->peer_list[peer->circuit_id], &peer->allowedips_list);
 	copy_and_assign_cidr(newnode, key, cidr, bits);
 
 	if (!node) {
@@ -230,11 +260,11 @@ static int add(struct allowedips_node __rcu **trie, u8 bits, const u8 *key,
 
 	node = kmem_cache_zalloc(node_cache, GFP_KERNEL);
 	if (unlikely(!node)) {
-		list_del(&newnode->peer_list);
+		list_del(&newnode->peer_list[0]);
 		kmem_cache_free(node_cache, newnode);
 		return -ENOMEM;
 	}
-	INIT_LIST_HEAD(&node->peer_list);
+	INIT_LIST_HEAD(&node->peer_list[0]);
 	copy_and_assign_cidr(node, newnode->bits, cidr, bits);
 
 	choose_and_connect_node(node, down);
@@ -302,13 +332,33 @@ void wg_allowedips_remove_by_peer(struct allowedips *table,
 {
 	struct allowedips_node *node, *child, **parent_bit, *parent, *tmp;
 	bool free_parent;
+	bool empty;
 
 	if (list_empty(&peer->allowedips_list))
 		return;
 	++table->seq;
-	list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list) {
-		list_del_init(&node->peer_list);
-		RCU_INIT_POINTER(node->peer, NULL);
+	list_for_each_entry_safe(node, tmp, &peer->allowedips_list, peer_list[peer->circuit_id]) {
+		list_del_init(&node->peer_list[peer->circuit_id]);
+		RCU_INIT_POINTER(node->peer[peer->circuit_id], NULL);
+
+
+		{
+			empty = true;
+
+			int i = 0;
+			for (; i < MAX_NODE_PEERS; i++)
+			{
+				if (rcu_access_pointer(node->peer[i])) {
+					empty = false;
+					break;
+				}
+			}
+
+			if (!empty)
+				continue;
+		}
+
+
 		if (node->bit[0] && node->bit[1])
 			continue;
 		child = rcu_dereference_protected(node->bit[!rcu_access_pointer(node->bit[0])],
@@ -319,10 +369,23 @@ void wg_allowedips_remove_by_peer(struct allowedips *table,
 		*parent_bit = child;
 		parent = (void *)parent_bit -
 			 offsetof(struct allowedips_node, bit[node->parent_bit_packed & 1]);
+		{
+			empty = true;
+
+			int i = 0;
+			for (; i < MAX_NODE_PEERS; i++)
+			{
+				if (rcu_access_pointer(parent->peer[i])) {
+					empty = false;
+					break;
+				}
+			}
+		}
+
 		free_parent = !rcu_access_pointer(node->bit[0]) &&
 			      !rcu_access_pointer(node->bit[1]) &&
 			      (node->parent_bit_packed & 3) <= 1 &&
-			      !rcu_access_pointer(parent->peer);
+			      empty;
 		if (free_parent)
 			child = rcu_dereference_protected(
 					parent->bit[!(node->parent_bit_packed & 1)],
@@ -354,9 +417,9 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
 					 struct sk_buff *skb)
 {
 	if (skb->protocol == htons(ETH_P_IP))
-		return lookup(table->root4, 32, &ip_hdr(skb)->daddr);
+		return lookup(table->root4, 32, &ip_hdr(skb)->daddr, TOS_MATCH(ip_hdr(skb)->tos));
 	else if (skb->protocol == htons(ETH_P_IPV6))
-		return lookup(table->root6, 128, &ipv6_hdr(skb)->daddr);
+		return lookup(table->root6, 128, &ipv6_hdr(skb)->daddr, 0);
 	return NULL;
 }
 
@@ -365,9 +428,9 @@ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
 					 struct sk_buff *skb)
 {
 	if (skb->protocol == htons(ETH_P_IP))
-		return lookup(table->root4, 32, &ip_hdr(skb)->saddr);
+		return lookup(table->root4, 32, &ip_hdr(skb)->saddr, TOS_MATCH(ip_hdr(skb)->tos));
 	else if (skb->protocol == htons(ETH_P_IPV6))
-		return lookup(table->root6, 128, &ipv6_hdr(skb)->saddr);
+		return lookup(table->root6, 128, &ipv6_hdr(skb)->saddr, 0);
 	return NULL;
 }
 

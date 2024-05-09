@@ -9,19 +9,21 @@
 #include <linux/mutex.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+enum { MAX_NODE_PEERS = 8 };
 
 struct wg_peer;
 
 struct allowedips_node {
-	struct wg_peer __rcu *peer;
+	struct wg_peer __rcu *peer[MAX_NODE_PEERS];
 	struct allowedips_node __rcu *bit[2];
 	u8 cidr, bit_at_a, bit_at_b, bitlen;
 	u8 bits[16] __aligned(__alignof(u64));
+	bool is_copy;
 
 	/* Keep rarely used members at bottom to be beyond cache line. */
 	unsigned long parent_bit_packed;
 	union {
-		struct list_head peer_list;
+		struct list_head peer_list[MAX_NODE_PEERS];
 		struct rcu_head rcu;
 	};
 };
